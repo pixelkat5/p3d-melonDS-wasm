@@ -44,16 +44,26 @@ void StopEmu()
 }
 
 
+// Under Emscripten, fopen()/fread()/fwrite() transparently operate against
+// whatever virtual filesystem is mounted (MEMFS by default, plus IDBFS at
+// /data, mounted from JS - see index.html). So a real fopen() wrapper here
+// is enough to make things like the DLDI-emulated SD card actually work,
+// as long as JS has written/mounted the backing file before melonDS tries
+// to open it (i.e. before Module._loadROM() is called).
 FILE* OpenFile(const char* path, const char* mode, bool mustexist)
 {
-    printf("attempt to open file: %s\n", path);
-    return NULL;
+    FILE* f = fopen(path, mode);
+    if (!f)
+        printf("OpenFile: failed to open '%s' (mode '%s')\n", path, mode);
+    return f;
 }
 
 FILE* OpenLocalFile(const char* path, const char* mode)
 {
-	    printf("attempt to open  local file: %s\n", path);
-    return NULL;
+    FILE* f = fopen(path, mode);
+    if (!f)
+        printf("OpenLocalFile: failed to open '%s' (mode '%s')\n", path, mode);
+    return f;
 }
 
 

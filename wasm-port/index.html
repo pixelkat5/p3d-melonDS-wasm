@@ -11,94 +11,313 @@
 
 <body>
     <style>
-        body {
-            background-color: black;
-        }
+        body { background-color: black; color: #ccc; font-family: sans-serif; touch-action: none; }
+        label { display: block; margin-top: 8px; font-size: 13px; }
+        #controls { margin-bottom: 12px; }
+        canvas { image-rendering: pixelated; }
     </style>
-    <input id="rom" type="file">
-    <canvas id="top" width="256" height="192"></canvas>
-    <canvas id="bottom" width="256" height="192"></canvas>
+    <div id="controls">
+        <label>BIOS7 / BIOS9 / Firmware / ROM (auto-detected by file size):
+            <input id="rom" type="file">
+        </label>
+        <label>SD Card Image (optional):
+            <input id="sdimg" type="file">
+        </label>
+        <label>Screen size:
+            <select id="scale">
+                <option value="1">1x (256x192)</option>
+                <option value="2" selected>2x (512x384)</option>
+                <option value="3">3x (768x576)</option>
+                <option value="4">4x (1024x768)</option>
+            </select>
+        </label>
+        <button id="enableAudio">Enable Audio</button>
+    </div>
+    <div id="screens" style="display:flex; flex-direction:column; align-items:center; gap:4px;">
+        <canvas id="top" width="256" height="192"></canvas>
+        <canvas id="bottom" width="256" height="192"></canvas>
+    </div>
     <script src="localforage.js"></script>
     <script src="a.out.js"></script>
     <script>
         var fileInput = document.getElementById('rom')
-        async function save(name) { var buf = await fileInput.files[0].arrayBuffer(); await localforage.setItem(name, new Uint8Array(buf)) }
+        var sdInput = document.getElementById('sdimg')
         var MemU8 = new Uint8Array()
-        var Bios7
-        var Bios9
-        var Firmware
+        var Bios7, Bios9, Firmware
         var ptrFrontBuffer
-        var FB = [[0,0],[0,0]]
+        var FB_PIXELS = 256 * 192
+        var fbU32          // view over the core's raw framebuffers (BGRA)
+        var outImg = [new ImageData(256, 192), new ImageData(256, 192)]
+        var outU32 = outImg.map((img) => new Uint32Array(img.data.buffer))
         var screenCanvas = [document.getElementById('top'), document.getElementById('bottom')]
-        var ctx2d = screenCanvas.map((v) => {return v.getContext('2d',{alpha:false})})
+        var ctx2d = screenCanvas.map((v) => v.getContext('2d', { alpha: false }))
 
         var frameCount = 0
         var prevCalcFPSTime = 0
 
+        var scaleSelect = document.getElementById('scale')
+        function applyScale() {
+            var n = parseInt(scaleSelect.value, 10)
+            screenCanvas.forEach((c) => {
+                c.style.width = (256 * n) + 'px'
+                c.style.height = (192 * n) + 'px'
+            })
+        }
+        scaleSelect.onchange = applyScale
+        applyScale()
+
+        // SPU native rate: DS ARM7 clock (33513982 Hz) / 1024 cycles per
+        // sample ~= 32729 Hz. AudioBuffer accepts any source sample rate
+        // and Web Audio resamples to the output device's rate on playback,
+        // so no manual resampling is needed here.
+        var SPU_SAMPLE_RATE = 32729
+        var audioCtx = null
+        var nextAudioTime = 0
+        var audioPtr = 0
+
+        document.getElementById('enableAudio').onclick = () => {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+            audioCtx.resume()
+            nextAudioTime = audioCtx.currentTime
+        }
+
+        function pumpAudio() {
+            if (!audioCtx || audioCtx.state !== 'running') return
+            var got = Module._readAudioOutput()
+            if (got <= 0) return
+            if (!audioPtr) audioPtr = Module._getSymbol(6)
+
+            // Interleaved S16 stereo -> two planar Float32 channels.
+            var interleaved = new Int16Array(MemU8.buffer, audioPtr, got * 2)
+            var buffer = audioCtx.createBuffer(2, got, SPU_SAMPLE_RATE)
+            var left = buffer.getChannelData(0)
+            var right = buffer.getChannelData(1)
+            for (var i = 0; i < got; i++) {
+                left[i] = interleaved[i * 2] / 32768
+                right[i] = interleaved[i * 2 + 1] / 32768
+            }
+
+            var src = audioCtx.createBufferSource()
+            src.buffer = buffer
+            src.connect(audioCtx.destination)
+
+            // Queue back-to-back; if we've fallen behind real time (e.g. a
+            // stutter), resync to "now" instead of trying to catch up, so
+            // audio doesn't build up a growing lag.
+            var startAt = Math.max(nextAudioTime, audioCtx.currentTime)
+            src.start(startAt)
+            nextAudioTime = startAt + got / SPU_SAMPLE_RATE
+        }
+
+        // Framebuffer is BGRA; ImageData needs RGBA, so swap R/B on copy
+        function blitScreen(screenIndex, srcBufferIndex) {
+            // memory layout is buffer-major, screen-minor
+            var srcOffset = (srcBufferIndex * 2 + screenIndex) * FB_PIXELS
+            var dst = outU32[screenIndex]
+            for (var p = 0; p < FB_PIXELS; p++) {
+                var w = fbU32[srcOffset + p]
+                // swap R and B, keep G and A
+                dst[p] = (w & 0xFF00FF00) | ((w & 0x00FF0000) >>> 16) | ((w & 0x000000FF) << 16)
+            }
+            ctx2d[screenIndex].putImageData(outImg[screenIndex], 0, 0)
+        }
+
         function runFrame() {
             Module._runFrame()
             var frontBuffer = MemU8[ptrFrontBuffer]
-            //console.log(frontBuffer)
-            ctx2d[0].putImageData(FB[frontBuffer][0], 0, 0)
-            ctx2d[1].putImageData(FB[frontBuffer][1], 0, 0)
-            frameCount ++
+            blitScreen(0, frontBuffer)
+            blitScreen(1, frontBuffer)
+            pumpAudio()
+            frameCount++
             if (frameCount % 100 == 0) {
                 var time = performance.now()
-                fps = 100 / ((time - prevCalcFPSTime) / 1000)
+                var fps = 100 / ((time - prevCalcFPSTime) / 1000)
                 prevCalcFPSTime = time
                 console.log('fps', fps)
             }
         }
 
+        // Active-low 12-bit mask matching the DS KEYINPUT register layout:
+        // bit0 A, bit1 B, bit2 Select, bit3 Start, bit4 Right, bit5 Left,
+        // bit6 Up, bit7 Down, bit8 R, bit9 L. 0 = pressed, 1 = released.
+        // Default (nothing pressed) is 0xFFF - matches melonDS's own default.
+        var KEY_BITS = {
+            'x': 0,          // A
+            'z': 1,          // B
+            'shift': 2,      // Select
+            'enter': 3,      // Start
+            'arrowright': 4,
+            'arrowleft': 5,
+            'arrowup': 6,
+            'arrowdown': 7,
+            's': 8,          // R (shoulder)
+            'a': 9,          // L (shoulder)
+        }
+        var keyMask = 0xFFF
+
+        function updateKeyMask(key, pressed) {
+            var bit = KEY_BITS[key]
+            if (bit === undefined) return
+            if (pressed) keyMask &= ~(1 << bit)
+            else keyMask |= (1 << bit)
+            if (Module._setKeyMask) Module._setKeyMask(keyMask >>> 0)
+        }
+
+        window.addEventListener('keydown', (e) => { updateKeyMask(e.key.toLowerCase(), true) })
+        window.addEventListener('keyup', (e) => { updateKeyMask(e.key.toLowerCase(), false) })
+
+        // --- Touch screen (bottom canvas) ---
+        var bottomCanvas = screenCanvas[1]
+        var touching = false
+
+        function canvasToDS(e) {
+            var rect = bottomCanvas.getBoundingClientRect()
+            var scaleX = bottomCanvas.width / rect.width
+            var scaleY = bottomCanvas.height / rect.height
+            var x = Math.round((e.clientX - rect.left) * scaleX)
+            var y = Math.round((e.clientY - rect.top) * scaleY)
+            x = Math.max(0, Math.min(255, x))
+            y = Math.max(0, Math.min(191, y))
+            return [x, y]
+        }
+
+        bottomCanvas.addEventListener('pointerdown', (e) => {
+            touching = true
+            var [x, y] = canvasToDS(e)
+            Module._touchScreen(x, y)
+            e.preventDefault()
+        })
+        bottomCanvas.addEventListener('pointermove', (e) => {
+            if (!touching) return
+            var [x, y] = canvasToDS(e)
+            Module._touchScreen(x, y)
+            e.preventDefault()
+        })
+        window.addEventListener('pointerup', () => {
+            if (!touching) return
+            touching = false
+            Module._releaseScreen()
+        })
+
+        var SD_PATH = '/data/sd.img'
+
+        // IndexedDB (and IDBFS, which just uses it) refuses to store any
+        // single value over ~1GB. Our SD image is bigger than that, so
+        // instead of IDBFS we split it into chunks and store those as
+        // separate localforage keys.
+        var SD_CHUNK_SIZE = 256 * 1024 * 1024
+        var sdLoaded = false
+
+        async function saveSDImage() {
+            if (!sdLoaded) return
+            var buf = Module.FS.readFile(SD_PATH)
+            var chunkCount = Math.ceil(buf.length / SD_CHUNK_SIZE)
+            await localforage.setItem('sdimg_meta', { length: buf.length, chunkSize: SD_CHUNK_SIZE, chunkCount })
+            for (var i = 0; i < chunkCount; i++) {
+                var start = i * SD_CHUNK_SIZE
+                var chunk = buf.slice(start, Math.min(start + SD_CHUNK_SIZE, buf.length))
+                await localforage.setItem('sdimg_chunk_' + i, chunk)
+            }
+        }
+
+        async function clearSDImage() {
+            var meta = await localforage.getItem('sdimg_meta')
+            if (meta) {
+                for (var i = 0; i < meta.chunkCount; i++) await localforage.removeItem('sdimg_chunk_' + i)
+            }
+            await localforage.removeItem('sdimg_meta')
+        }
+
+        async function loadSDImage() {
+            var meta = await localforage.getItem('sdimg_meta')
+            if (!meta) return null
+            var buf = new Uint8Array(meta.length)
+            var offset = 0
+            for (var i = 0; i < meta.chunkCount; i++) {
+                var chunk = await localforage.getItem('sdimg_chunk_' + i)
+                if (!chunk) {
+                    console.error('SD image storage incomplete (missing chunk ' + i + ') - discarding')
+                    await clearSDImage()
+                    return null
+                }
+                buf.set(chunk, offset)
+                offset += chunk.length
+            }
+            return buf
+        }
+
+        async function initSDFS() {
+            try { Module.FS.mkdir('/data') } catch (e) { /* already exists */ }
+            var saved = await loadSDImage()
+            if (saved) {
+                Module.FS.writeFile(SD_PATH, saved)
+                sdLoaded = true
+            }
+        }
+
+        sdInput.onchange = async () => {
+            var file = sdInput.files[0]
+            if (!file) return
+            var buf = new Uint8Array(await file.arrayBuffer())
+            Module.FS.writeFile(SD_PATH, buf)
+            sdLoaded = true
+            await saveSDImage()
+            alert('SD card image loaded (' + buf.length + ' bytes) and saved for future sessions.')
+        }
+
+        // Periodically re-persist the SD image so writes (in-game saves)
+        // survive the tab being closed without a clean unload.
+        setInterval(() => { saveSDImage().catch(console.error) }, 10000)
+        window.addEventListener('beforeunload', () => { saveSDImage() })
+
         async function wasmReady() {
             MemU8 = Module.HEAPU8
             ptrFrontBuffer = Module._getSymbol(5)
             var fb = Module._getSymbol(4)
-            console.log(fb)
-            for (var i = 0; i < 4; i++) {
-                FB[i>>1][i%2] = new ImageData(new Uint8ClampedArray(MemU8.buffer).subarray(fb + 256*192*4*i,fb + 256*192*4*(i+1)), 256, 192)
-            }
+            fbU32 = new Uint32Array(MemU8.buffer, fb, FB_PIXELS * 4)
+
+            await initSDFS()
 
             Bios7 = await localforage.getItem('bios7')
             Bios9 = await localforage.getItem('bios9')
             Firmware = await localforage.getItem('firmware')
             var ROM = await localforage.getItem('rom')
-            
 
-            Module._reset();
+            var missing = []
+            if (!Bios7) missing.push('bios7.bin (16384 bytes)')
+            if (!Bios9) missing.push('bios9.bin (4096 bytes)')
+            if (!Firmware) missing.push('firmware.bin (256KB, or 128/512KB)')
+            if (!ROM) missing.push('a ROM file')
+            if (missing.length) {
+                var msg = 'Missing from browser storage, please upload via the file input above:\n' + missing.join('\n')
+                console.error(msg)
+                alert(msg)
+                return
+            }
+
+            Module._reset()
             MemU8.set(Bios7, Module._getSymbol(0))
             MemU8.set(Bios9, Module._getSymbol(1))
             MemU8.set(Firmware, Module._getSymbol(2))
             MemU8.set(ROM, Module._getSymbol(3))
-            Module._loadROM(ROM.length);
+            Module._loadROM(ROM.length)
 
             setInterval(runFrame, 1000 / 120)
         }
 
         fileInput.onchange = async () => {
             var file = fileInput.files[0]
-            if (!file) {
-                return
-            }
+            if (!file) return
             var buf = new Uint8Array(await file.arrayBuffer())
             var fileType = 'rom'
-            if (buf.length == 4096) {
-                fileType = 'bios9'
-            }
-            if (buf.length == 16384) {
-                fileType = 'bios7'
-            }
-            if (buf.length == 256*1024) {
-                fileType = 'firmware'
-            }
+            if (buf.length == 4096) fileType = 'bios9'
+            if (buf.length == 16384) fileType = 'bios7'
+            if (buf.length == 128 * 1024 || buf.length == 256 * 1024 || buf.length == 512 * 1024) fileType = 'firmware'
 
             await localforage.setItem(fileType, buf)
-            alert(fileType + ' loaded!')
-
+            alert('Detected as: ' + fileType + '\nFile size: ' + buf.length + ' bytes\n(bios9=4096, bios7=16384, firmware=131072/262144/524288, anything else=rom)')
         }
-        
 
-        
     </script>
 </body>
 
